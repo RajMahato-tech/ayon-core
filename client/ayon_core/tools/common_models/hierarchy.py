@@ -95,11 +95,12 @@ class TaskItem:
         name (str): Name of task.
         task_type (str): Type of task.
         parent_id (str): Parent folder id.
+        assignees (list[str]): List of users assigned to task.
         icon (Union[dict[str, Any], None]): Icon definitions.
     """
 
     def __init__(
-        self, task_id, name, task_type, parent_id, icon
+        self, task_id, name, task_type, parent_id, icon, assignees=None
     ):
         self.task_id = task_id
         self.name = name
@@ -112,6 +113,10 @@ class TaskItem:
                 "color": get_default_entity_icon_color()
             }
         self.icon = icon
+        
+        if not assignees:
+            assignees = []
+        self.assignees = assignees
 
         self._label = None
 
@@ -150,6 +155,7 @@ class TaskItem:
             "parent_id": self.parent_id,
             "task_type": self.task_type,
             "icon": self.icon,
+            "assignees": self.assignees,
         }
 
     @classmethod
@@ -181,7 +187,8 @@ def _get_task_items_from_tasks(tasks):
             task["name"],
             task["type"],
             folder_id,
-            None
+            None,
+            assignees=task.get("assignees")
         ))
     return output
 
@@ -272,6 +279,53 @@ class HierarchyModel(object):
             self._refresh_folders_cache(project_name, sender)
         return self._folders_items[project_name].get_data()
 
+    def get_assigned_folder_paths(
+        self, project_name, sender=None, assignee=None
+    ):
+        """Get folder paths assigned to user by project name.
+
+        If a child folder is assigned (i.e. /season/seq/sh010) this
+        function will also return all the parent entities on the
+        hierarchy (i.e. ["/season", "/season/seq"]) because it
+        contains children folders assigned to the user.
+
+        Args:
+            project_name (str): Name of project where to look for folders.
+            sender (Union[str, None]): Who requested the folder ids.
+            assignee (Union[str, None]): User we want to check folders
+                assigned to.
+
+        Returns:
+            set[str]: Folder paths assigned to user.
+        """
+        assigned_folder_paths = set()
+
+        # Return early if project doesn't exist
+        project_entity = ayon_api.get_project(project_name)
+        if not project_entity:
+            return assigned_folder_paths
+
+        if not assignee:
+            assignee = ayon_api.get_user()["name"]
+
+        tasks = ayon_api.get_tasks(project_name, assignees=[assignee])
+        if not tasks:
+            return assigned_folder_paths
+        
+        folder_items = self.get_folder_items(project_name, sender)
+        if not folder_items:
+            return assigned_folder_paths
+
+        for task in tasks:
+            folder_id = task["folderId"]
+            folder_path = folder_items[folder_id].path
+            # Add all parent hierarchy as individual entries
+            while "/" in folder_path:
+                assigned_folder_paths.add(folder_path)
+                folder_path, _ = folder_path.rsplit("/", 1)
+
+        return assigned_folder_paths
+    
     def get_folder_items_by_id(self, project_name, folder_ids):
         """Get folder items by ids.
 
@@ -569,6 +623,6 @@ class HierarchyModel(object):
         tasks = list(ayon_api.get_tasks(
             project_name,
             folder_ids=[folder_id],
-            fields={"id", "name", "label", "folderId", "type"}
+            fields={"id", "name", "label", "folderId", "type", "assignees"}
         ))
         return _get_task_items_from_tasks(tasks)
