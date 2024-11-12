@@ -93,13 +93,15 @@ class ContainerItem:
         loader_name,
         namespace,
         object_name,
-        item_id
+        item_id,
+        project_name
     ):
         self.representation_id = representation_id
         self.loader_name = loader_name
         self.object_name = object_name
         self.namespace = namespace
         self.item_id = item_id
+        self.project_name = project_name
 
     @classmethod
     def from_container_data(cls, container):
@@ -109,6 +111,7 @@ class ContainerItem:
             namespace=container["namespace"],
             object_name=container["objectName"],
             item_id=uuid.uuid4().hex,
+            project_name=container.get("project_name", None)
         )
 
 
@@ -189,15 +192,21 @@ class ContainersModel:
         self._items_cache = None
         self._containers_by_id = {}
         self._container_items_by_id = {}
+        self._container_items_by_project = {}
+        self._project_name_by_repre_id = {}
         self._version_items_by_product_id = {}
         self._repre_info_by_id = {}
+        self._product_id_by_project = {}
 
     def reset(self):
         self._items_cache = None
         self._containers_by_id = {}
         self._container_items_by_id = {}
+        self._container_items_by_project = {}
+        self._project_name_by_repre_id = {}
         self._version_items_by_product_id = {}
         self._repre_info_by_id = {}
+        self._product_id_by_project = {}
 
     def get_containers(self):
         self._update_cache()
@@ -221,7 +230,8 @@ class ContainersModel:
 
     def get_representation_info_items(self, representation_ids):
         output = {}
-        missing_repre_ids = set()
+        missing_repre_ids_by_project = {}
+        current_project_name = self._controller.get_current_project_name()
         for repre_id in representation_ids:
             try:
                 uuid.UUID(repre_id)
@@ -229,61 +239,71 @@ class ContainersModel:
                 output[repre_id] = RepresentationInfo.new_invalid()
                 continue
 
+            project_name = self._project_name_by_repre_id.get(repre_id)
+            if project_name is None:
+                project_name = current_project_name
             repre_info = self._repre_info_by_id.get(repre_id)
             if repre_info is None:
-                missing_repre_ids.add(repre_id)
+                missing_repre_ids_by_project.setdefault(
+                    project_name, set()
+                    ).add(repre_id)
             else:
                 output[repre_id] = repre_info
 
-        if not missing_repre_ids:
+        if not missing_repre_ids_by_project:
             return output
 
-        project_name = self._controller.get_current_project_name()
-        repre_hierarchy_by_id = get_representations_hierarchy(
-            project_name, missing_repre_ids
-        )
-        for repre_id, repre_hierarchy in repre_hierarchy_by_id.items():
-            kwargs = {
-                "folder_id": None,
-                "folder_path": None,
-                "product_id": None,
-                "product_name": None,
-                "product_type": None,
-                "product_group": None,
-                "version_id": None,
-                "representation_name": None,
-            }
-            folder = repre_hierarchy.folder
-            product = repre_hierarchy.product
-            version = repre_hierarchy.version
-            repre = repre_hierarchy.representation
-            if folder:
-                kwargs["folder_id"] = folder["id"]
-                kwargs["folder_path"] = folder["path"]
-            if product:
-                group = product["attrib"]["productGroup"]
-                kwargs["product_id"] = product["id"]
-                kwargs["product_name"] = product["name"]
-                kwargs["product_type"] = product["productType"]
-                kwargs["product_group"] = group
-            if version:
-                kwargs["version_id"] = version["id"]
-            if repre:
-                kwargs["representation_name"] = repre["name"]
+        for project_name, missing_ids in missing_repre_ids_by_project.items():
+            repre_hierarchy_by_id = get_representations_hierarchy(
+                project_name, missing_ids
+            )
+            for repre_id, repre_hierarchy in repre_hierarchy_by_id.items():
+                kwargs = {
+                    "folder_id": None,
+                    "folder_path": None,
+                    "product_id": None,
+                    "product_name": None,
+                    "product_type": None,
+                    "product_group": None,
+                    "version_id": None,
+                    "representation_name": None,
+                }
+                folder = repre_hierarchy.folder
+                product = repre_hierarchy.product
+                version = repre_hierarchy.version
+                repre = repre_hierarchy.representation
+                if folder:
+                    kwargs["folder_id"] = folder["id"]
+                    kwargs["folder_path"] = folder["path"]
+                if product:
+                    group = product["attrib"]["productGroup"]
+                    kwargs["product_id"] = product["id"]
+                    kwargs["product_name"] = product["name"]
+                    kwargs["product_type"] = product["productType"]
+                    kwargs["product_group"] = group
+                if version:
+                    kwargs["version_id"] = version["id"]
+                if repre:
+                    kwargs["representation_name"] = repre["name"]
 
-            repre_info = RepresentationInfo(**kwargs)
-            self._repre_info_by_id[repre_id] = repre_info
-            output[repre_id] = repre_info
+                repre_info = RepresentationInfo(**kwargs)
+                self._repre_info_by_id[repre_id] = repre_info
+                self._product_id_by_project[project_name] = repre_info.product_id
+                output[repre_id] = repre_info
         return output
 
-    def get_version_items(self, product_ids):
+    def get_version_items(self, product_ids, project_names):
         if not product_ids:
             return {}
-
         missing_ids = {
             product_id
             for product_id in product_ids
             if product_id not in self._version_items_by_product_id
+        }
+
+        product_ids_by_project = {
+            project_name: self._product_id_by_project.get(project_name)
+            for project_name in project_names
         }
         if missing_ids:
             status_items_by_name = {
@@ -293,25 +313,27 @@ class ContainersModel:
 
             def version_sorted(entity):
                 return entity["version"]
-
-            project_name = self._controller.get_current_project_name()
+            version_entities_list = []
             version_entities_by_product_id = {
                 product_id: []
                 for product_id in missing_ids
             }
+            for project_name, product_id in product_ids_by_project.items():
+                if product_id not in missing_ids:
+                    continue
+                version_entities = list(ayon_api.get_versions(
+                    project_name,
+                    product_ids={product_id},
+                    fields={"id", "version", "productId", "status"}
+                ))
 
-            version_entities = list(ayon_api.get_versions(
-                project_name,
-                product_ids=missing_ids,
-                fields={"id", "version", "productId", "status"}
-            ))
-            version_entities.sort(key=version_sorted)
-            for version_entity in version_entities:
+                version_entities_list.extend(version_entities)
+            version_entities_list.sort(key=version_sorted)
+            for version_entity in version_entities_list:
                 product_id = version_entity["productId"]
                 version_entities_by_product_id[product_id].append(
                     version_entity
                 )
-
             for product_id, version_entities in (
                 version_entities_by_product_id.items()
             ):
@@ -337,7 +359,6 @@ class ContainersModel:
                 self._version_items_by_product_id[product_id] = (
                     version_items_by_id
                 )
-
         return {
             product_id: dict(self._version_items_by_product_id[product_id])
             for product_id in product_ids
@@ -358,6 +379,7 @@ class ContainersModel:
         container_items = []
         containers_by_id = {}
         container_items_by_id = {}
+        project_name_by_repre_id = {}
         invalid_ids_mapping = {}
         for container in containers:
             try:
@@ -381,8 +403,10 @@ class ContainersModel:
 
             containers_by_id[item.item_id] = container
             container_items_by_id[item.item_id] = item
+            project_name_by_repre_id[item.representation_id] = item.project_name
             container_items.append(item)
 
         self._containers_by_id = containers_by_id
         self._container_items_by_id = container_items_by_id
+        self._project_name_by_repre_id = project_name_by_repre_id
         self._items_cache = container_items
